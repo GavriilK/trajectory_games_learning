@@ -24,6 +24,14 @@ from dataclasses import dataclass
 import math
 
 
+# Configuration constants
+DEFAULT_VELOCITY = 15.0  # m/s (~54 km/h)
+DEFAULT_SAFE_DISTANCE = 5.0  # meters
+DEFAULT_GOAL_DISTANCE = 50.0  # meters
+MIN_INTEGRATION_STEPS = 10
+STEPS_PER_UNIT_LENGTH = 10
+
+
 @dataclass
 class VehicleState:
     """Represents the state of a vehicle at a given time"""
@@ -99,7 +107,7 @@ class ClothoidSegment:
         
         # Fresnel integrals approximation for clothoid computation
         # For small curvature rates, we use numerical integration
-        n_steps = max(10, int(abs(s) * 10))
+        n_steps = max(MIN_INTEGRATION_STEPS, int(abs(s) * STEPS_PER_UNIT_LENGTH))
         ds = s / n_steps
         
         x, y, theta = self.start_state.x, self.start_state.y, self.start_state.theta
@@ -236,16 +244,19 @@ class GameTheoreticPlanner:
     and other agents (human drivers) in the environment.
     """
     
-    def __init__(self, n_agents: int = 2, horizon: int = 50):
+    def __init__(self, n_agents: int = 2, horizon: int = 50, 
+                 safe_distance: float = DEFAULT_SAFE_DISTANCE):
         """
         Initialize the game-theoretic planner
         
         Args:
             n_agents: Number of agents in the game (including ego vehicle)
             horizon: Planning horizon in time steps
+            safe_distance: Minimum safe distance between vehicles (meters)
         """
         self.n_agents = n_agents
         self.horizon = horizon
+        self.safe_distance = safe_distance
         
     def compute_utility(self, trajectory: List[TrajectoryPoint],
                        other_trajectories: List[List[TrajectoryPoint]],
@@ -271,7 +282,7 @@ class GameTheoreticPlanner:
         safety_weight = preferences.get('safety_weight', 2.0)
         
         # Penalize deviation from desired velocity
-        desired_velocity = preferences.get('desired_velocity', 15.0)  # m/s
+        desired_velocity = preferences.get('desired_velocity', DEFAULT_VELOCITY)
         for point in trajectory:
             velocity_error = (point.state.v - desired_velocity) ** 2
             utility -= comfort_weight * velocity_error
@@ -294,9 +305,8 @@ class GameTheoreticPlanner:
                     distance = np.sqrt(dx**2 + dy**2)
                     
                     # Penalize small distances (collision avoidance)
-                    safe_distance = 5.0  # meters
-                    if distance < safe_distance:
-                        utility -= safety_weight * (safe_distance - distance) ** 2
+                    if distance < self.safe_distance:
+                        utility -= safety_weight * (self.safe_distance - distance) ** 2
         
         # Goal reaching: reward being close to goal
         if len(trajectory) > 0:
@@ -312,7 +322,8 @@ class GameTheoreticPlanner:
     
     def find_nash_equilibrium(self, initial_states: List[VehicleState],
                              preferences: List[Dict],
-                             max_iterations: int = 100) -> List[List[TrajectoryPoint]]:
+                             max_iterations: int = 100,
+                             goal_distance: float = DEFAULT_GOAL_DISTANCE) -> List[List[TrajectoryPoint]]:
         """
         Find Nash Equilibrium trajectories for all agents
         
@@ -320,6 +331,7 @@ class GameTheoreticPlanner:
             initial_states: Initial states of all agents
             preferences: Preference parameters for each agent
             max_iterations: Maximum number of iterations for equilibrium search
+            goal_distance: Distance ahead to set as goal for trajectory generation
             
         Returns:
             List of equilibrium trajectories for each agent
@@ -331,10 +343,10 @@ class GameTheoreticPlanner:
         for i, state in enumerate(initial_states):
             # Create simple goal state
             goal_state = VehicleState(
-                x=state.x + 50.0,
+                x=state.x + goal_distance,
                 y=state.y,
                 theta=state.theta,
-                v=preferences[i].get('desired_velocity', 15.0)
+                v=preferences[i].get('desired_velocity', DEFAULT_VELOCITY)
             )
             
             traj = traj_generator.generate_trajectory(state, goal_state, horizon=5.0)
@@ -362,10 +374,10 @@ class GameTheoreticPlanner:
                 # Sample some alternative trajectories
                 for offset_y in [-1.0, 0.0, 1.0]:
                     goal_state = VehicleState(
-                        x=initial_states[agent_id].x + 50.0,
+                        x=initial_states[agent_id].x + goal_distance,
                         y=initial_states[agent_id].y + offset_y,
                         theta=initial_states[agent_id].theta,
-                        v=preferences[agent_id].get('desired_velocity', 15.0)
+                        v=preferences[agent_id].get('desired_velocity', DEFAULT_VELOCITY)
                     )
                     
                     candidate_traj = traj_generator.generate_trajectory(
@@ -447,7 +459,9 @@ class GTPUDrive:
     """
     
     def __init__(self, ego_id: int = 0, dt: float = 0.1,
-                 planning_horizon: float = 5.0):
+                 planning_horizon: float = 5.0,
+                 desired_velocity: float = DEFAULT_VELOCITY,
+                 safe_distance: float = DEFAULT_SAFE_DISTANCE):
         """
         Initialize GTP-UDrive system
         
@@ -455,19 +469,25 @@ class GTPUDrive:
             ego_id: ID of the ego vehicle (AV)
             dt: Time discretization step
             planning_horizon: Planning horizon in seconds
+            desired_velocity: Desired velocity for ego vehicle (m/s)
+            safe_distance: Minimum safe distance between vehicles (meters)
         """
         self.ego_id = ego_id
         self.dt = dt
         self.planning_horizon = planning_horizon
+        self.safe_distance = safe_distance
         
         # Initialize components
         self.trajectory_generator = ClothoidTrajectoryGenerator(dt=dt)
-        self.game_planner = GameTheoreticPlanner(horizon=int(planning_horizon / dt))
+        self.game_planner = GameTheoreticPlanner(
+            horizon=int(planning_horizon / dt),
+            safe_distance=safe_distance
+        )
         self.intention_predictor = IntentionPredictor()
         
         # Ego vehicle preferences
         self.ego_preferences = {
-            'desired_velocity': 15.0,  # m/s (~54 km/h)
+            'desired_velocity': desired_velocity,
             'goal_weight': 1.0,
             'comfort_weight': 0.5,
             'safety_weight': 2.0,
@@ -497,7 +517,7 @@ class GTPUDrive:
             
             # Convert to preference dictionary
             prefs = {
-                'desired_velocity': float(intentions[0, 0]) + 15.0,  # Base + learned
+                'desired_velocity': float(intentions[0, 0]) + DEFAULT_VELOCITY,
                 'goal_weight': float(torch.sigmoid(intentions[0, 1])),
                 'comfort_weight': float(torch.sigmoid(intentions[0, 2])),
                 'safety_weight': float(torch.sigmoid(intentions[0, 3])) * 2.0,
@@ -535,7 +555,7 @@ class GTPUDrive:
             # Use default preferences for human drivers
             predicted_prefs = [
                 {
-                    'desired_velocity': 15.0,
+                    'desired_velocity': DEFAULT_VELOCITY,
                     'goal_weight': 1.0,
                     'comfort_weight': 0.5,
                     'safety_weight': 1.5,
@@ -582,8 +602,7 @@ class GTPUDrive:
                     min_distance = min(min_distance, distance)
         
         # Convert to safety score (exponential decay)
-        safe_distance = 5.0  # meters
-        safety_score = 1.0 - np.exp(-min_distance / safe_distance)
+        safety_score = 1.0 - np.exp(-min_distance / self.safe_distance)
         
         return safety_score
     
