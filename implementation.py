@@ -214,7 +214,7 @@ class ClothoidTrajectoryGenerator:
             Smooth trajectory passing through waypoints
         """
         if len(waypoints) < 2:
-            raise ValueError("Need at least 2 waypoints for interpolation")
+            raise ValueError(f"Need at least 2 waypoints for interpolation, got {len(waypoints)}")
         
         trajectory = []
         time = 0.0
